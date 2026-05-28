@@ -1,4 +1,4 @@
-app-title = Ethereal Waves
+app-title = RPGed 64
 about = About
 repository = Repository
 git-description = Git commit {$hash} on {$date}
