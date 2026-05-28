@@ -1,0 +1,10 @@
+[Desktop Entry]
+Name=RPGed 64
+Comment=A C64 RPG Editor is an editor for creating RPG games on the Commodore 64.
+Type=Application
+Icon=com.galacticpirateradio.rpged64
+Exec=rpged64 %F
+Terminal=false
+StartupNotify=true
+Categories=COSMIC;Gaming;
+Keywords=COSMIC;Gaming;

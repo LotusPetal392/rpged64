@@ -1,0 +1,73 @@
+# Name of the application's binary.
+name := 'rpged64'
+# The unique ID of the application.
+appid := 'com.galacticpirateradio.rpged64'
+
+# Path to root file system, which defaults to `/`.
+rootdir := ''
+# The prefix for the `/usr` directory.
+prefix := '/usr'
+# The location of the cargo target directory.
+cargo-target-dir := env('CARGO_TARGET_DIR', 'target')
+
+# Application's appstream metadata
+appdata := appid + '.metainfo.xml'
+# Application's desktop entry
+desktop := appid + '.desktop'
+# Application's icon.
+icon-svg := appid + '.svg'
+
+# Install destinations
+base-dir := absolute_path(clean(rootdir / prefix))
+appdata-dst := base-dir / 'share' / 'appdata' / appdata
+bin-dst := base-dir / 'bin' / name
+desktop-dst := base-dir / 'share' / 'applications' / desktop
+icons-dst := base-dir / 'share' / 'icons' / 'hicolor'
+icon-svg-dst := icons-dst / 'scalable' / 'apps'
+
+# Default recipe which runs `just build-release`
+default: build-release
+
+# Runs `cargo clean`
+clean:
+    cargo clean
+
+# Removes vendored dependencies
+clean-vendor:
+    rm -rf .cargo vendor vendor.tar
+
+# `cargo clean` and removes vendored dependencies
+clean-dist: clean clean-vendor
+
+# Compiles with debug profile
+build-debug *args:
+    cargo build {{ args }}
+
+# Compiles with release profile
+build-release *args: (build-debug '--release' args)
+
+# Runs a clippy check
+check *args:
+    cargo clippy --all-features {{ args }} -- -W clippy::pedantic
+
+# Runs a clippy check with JSON message format
+check-json: (check '--message-format=json')
+
+# Run the application for testing purposes
+run *args:
+    env RUST_BACKTRACE=full cargo run --release {{ args }}
+
+# Run with dev profile
+run-dev:
+    cargo run
+
+# Installs files
+install:
+    install -Dm0755 {{ cargo-target-dir / 'release' / name }} {{ bin-dst }}
+    install -Dm0644 {{ 'resources' / desktop }} {{ desktop-dst }}
+    install -Dm0644 {{ 'resources' / appdata }} {{ appdata-dst }}
+    install -Dm0644 {{ 'resources' / 'icons' / 'hicolor' / 'scalable' / 'apps' / icon-svg }} {{ icon-svg-dst }}
+
+# Uninstalls installed files
+uninstall:
+    rm {{ bin-dst }} {{ desktop-dst }} {{ icon-svg-dst / icon-svg }}

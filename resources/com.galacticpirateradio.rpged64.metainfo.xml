@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<component type="desktop-application">
+    <id>com.galacticpirateradio.rpged64</id>
+    <metadata_license>CC0-1.0</metadata_license>
+    <project_license>GPL-3.0</project_license>
+    <name>RPGed 64</name>
+    <developer id="com.galacticpirateradio">
+        <name>Natalie Rockot</name>
+    </developer>
+    <summary>C64 RPG Editor</summary>
+    <description>
+        <p>
+            A C64 RPG Editor is an editor for creating RPG games on the Commodore 64.
+        </p>
+    </description>
+    <icon type="stock">com.galacticpirateradio.rpged64</icon>
+    <url type="homepage">https://galacticpirateradio.com/software</url>
+    <url type="vcs-browser">https://github.com/cosmic-utils/rpged64</url>
+    <url type="bugtracker">https://github.com/cosmic-utils/rpged64/issues</url>
+    <releases>
+      <release version="0.1.2" date="2026-02-23">
+        <description>
+          <p>Flatpak update</p>
+        </description>
+      </release>
+    </releases>
+    <launchable
+        type="desktop-id"
+    >com.galacticpirateradio.rpgedc64.desktop</launchable>
+    <provides>
+        <binary>rpged64</binary>
+    </provides>
+    <requires>
+        <display_length compare="ge">360</display_length>
+    </requires>
+    <supports>
+        <control>keyboard</control>
+        <control>pointing</control>
+        <control>touch</control>
+    </supports>
+    <categories>
+        <category>COSMIC</category>
+        <category>Gaming</category>
+    </categories>
+    <keywords>
+        <keyword>COSMIC</keyword>
+        <keyword>КОСМІК</keyword>
+    </keywords>
+    <content_rating type="oars-1.1" />
+</component>
