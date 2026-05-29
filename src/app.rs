@@ -9,18 +9,24 @@ use cosmic::prelude::*;
 use cosmic::{
     app::context_drawer,
     cosmic_config::{self, CosmicConfigEntry},
+    dialog::file_chooser,
     iced::{
         Length, Size, Subscription,
         alignment::{Horizontal, Vertical},
         event::{self, Event},
+        keyboard::{Key, Modifiers, key::Physical},
         window::Event as WindowEvent,
     },
     surface,
-    widget::{self, about::About, menu, nav_bar, settings},
+    widget::{self, about::About, menu, nav_bar, segmented_button, settings, tab_bar},
 };
-
-use std::fmt::Debug;
-use std::{collections::HashMap, process};
+use std::{
+    collections::{HashMap, HashSet},
+    fmt::Debug,
+    fs, io,
+    path::PathBuf,
+    process,
+};
 
 const REPOSITORY: &str = env!("CARGO_PKG_REPOSITORY");
 const APP_ICON: &[u8] =
@@ -37,6 +43,8 @@ pub struct AppModel {
     about: About,
     /// Contains items assigned to the nav bar panel.
     nav: nav_bar::Model,
+    /// Contains open editor tabs.
+    tabs: segmented_button::SingleSelectModel,
     /// Key bindings for the application's menu bar.
     pub key_binds: HashMap<menu::KeyBind, MenuAction>,
     /// Configuration data that persists between application runs.
@@ -49,13 +57,27 @@ pub struct AppModel {
     config_handler: Option<cosmic_config::Config>,
     state_handler: Option<cosmic_config::Config>,
     pub state: crate::config::State,
+    project: Option<Project>,
+    collapsed_project_file_kinds: HashSet<ProjectFileKind>,
+    selected_project_file: Option<PathBuf>,
 }
 
 /// Messages emitted by the application and its widgets.
 #[derive(Debug, Clone)]
 pub enum Message {
     AppTheme(AppTheme),
+    KeyPressed {
+        key: Key,
+        modifiers: Modifiers,
+        physical_key: Physical,
+    },
     LaunchUrl(String),
+    OpenProject,
+    ProjectFolderDialogCancelled,
+    ProjectFolderDialogError(String),
+    ProjectFolderSelected(PathBuf),
+    TabActivated(segmented_button::Entity),
+    TabClosed(segmented_button::Entity),
     Quit,
     Surface(surface::Action),
     ToggleContextPage(ContextPage),
@@ -110,6 +132,7 @@ impl cosmic::Application for AppModel {
             context_page: ContextPage::default(),
             about,
             nav,
+            tabs: segmented_button::Model::default(),
             key_binds: key_binds(),
             config: cosmic_config::Config::new(APP_ID, CONFIG_VERSION)
                 .map(|context| match Config::get_entry(&context) {
@@ -123,6 +146,9 @@ impl cosmic::Application for AppModel {
             config_handler: _flags.config_handler,
             state_handler: _flags.state_handler,
             state: _flags.state.clone(),
+            project: None,
+            collapsed_project_file_kinds: HashSet::new(),
+            selected_project_file: None,
         };
 
         // Create a startup command that sets the window title.
@@ -164,7 +190,26 @@ impl cosmic::Application for AppModel {
 
     /// Describes the interface based on the current state of the application model.
     fn view(&self) -> Element<'_, Self::Message> {
-        let content = widget::column([widget::text("test").into()]);
+        let content: Element<'_, Self::Message> = if self.tabs.len() == 0 {
+            match &self.project {
+                Some(project) => widget::column([
+                    widget::text(format!("Project: {}", project.root.display())).into(),
+                    widget::text(format!("{} project files", project.files.len())).into(),
+                    widget::text(fl!("select-file-to-open")).into(),
+                ])
+                .into(),
+                None => widget::column([widget::text(fl!("no-project-open")).into()]).into(),
+            }
+        } else {
+            let tab_bar = tab_bar::horizontal(&self.tabs)
+                .show_close_icon_on_hover(true)
+                .on_activate(Message::TabActivated)
+                .on_close(Message::TabClosed)
+                .width(Length::Fill)
+                .into();
+
+            widget::column([tab_bar, self.active_tab_view()]).into()
+        };
 
         widget::container(content)
             .apply(widget::container)
@@ -180,6 +225,16 @@ impl cosmic::Application for AppModel {
         // Add subscriptions which are always active.
         let subscriptions = vec![
             event::listen_with(|event, _status, _window_id| match event {
+                Event::Keyboard(cosmic::iced::keyboard::Event::KeyPressed {
+                    key,
+                    modifiers,
+                    physical_key,
+                    ..
+                }) => Some(Message::KeyPressed {
+                    key,
+                    modifiers,
+                    physical_key,
+                }),
                 Event::Window(WindowEvent::CloseRequested) => Some(Message::Quit),
                 Event::Window(WindowEvent::Closed) => Some(Message::Quit),
                 Event::Window(WindowEvent::Resized(size)) => Some(Message::WindowResized(size)),
@@ -262,12 +317,76 @@ impl cosmic::Application for AppModel {
                 return self.update_config();
             }
 
+            Message::KeyPressed {
+                key,
+                modifiers,
+                physical_key,
+            } => {
+                if let Some(action) = self.key_binds.iter().find_map(|(key_bind, action)| {
+                    key_bind
+                        .matches(modifiers, &key, Some(&physical_key))
+                        .then_some(action)
+                }) {
+                    return self.update(<MenuAction as menu::action::MenuAction>::message(action));
+                }
+            }
+
             Message::LaunchUrl(url) => match open::that_detached(&url) {
                 Ok(()) => {}
                 Err(err) => {
                     eprintln!("failed to open {url:?}: {err}");
                 }
             },
+
+            Message::OpenProject => {
+                return cosmic::task::future(async move {
+                    let dialog = file_chooser::open::Dialog::new()
+                        .title(fl!("open-project-folder-title"))
+                        .accept_label(fl!("open"));
+
+                    match dialog.open_folder().await {
+                        Ok(response) => match response.url().to_file_path() {
+                            Ok(path) => Message::ProjectFolderSelected(path),
+                            Err(()) => Message::ProjectFolderDialogError(format!(
+                                "{} is not a local folder path",
+                                response.url()
+                            )),
+                        },
+                        Err(file_chooser::Error::Cancelled) => {
+                            Message::ProjectFolderDialogCancelled
+                        }
+                        Err(err) => Message::ProjectFolderDialogError(err.to_string()),
+                    }
+                });
+            }
+
+            Message::ProjectFolderDialogCancelled => {}
+
+            Message::ProjectFolderDialogError(err) => {
+                eprintln!("failed to open project folder dialog: {err}");
+            }
+
+            Message::ProjectFolderSelected(path) => match Project::open(path) {
+                Ok(project) => {
+                    self.project = Some(project);
+                    self.tabs.clear();
+                    self.collapsed_project_file_kinds.clear();
+                    self.selected_project_file = None;
+                    self.rebuild_project_nav();
+                    return self.update_title();
+                }
+                Err(err) => {
+                    eprintln!("failed to open project: {err}");
+                }
+            },
+
+            Message::TabActivated(id) => {
+                self.tabs.activate(id);
+            }
+
+            Message::TabClosed(id) => {
+                self.close_tab(id);
+            }
 
             Message::Quit => {
                 process::exit(0);
@@ -306,8 +425,22 @@ impl cosmic::Application for AppModel {
 
     /// Called when a nav item is selected.
     fn on_nav_select(&mut self, id: nav_bar::Id) -> Task<cosmic::Action<Self::Message>> {
-        // Activate the page in the model.
-        self.nav.activate(id);
+        match self.nav.data::<ProjectNavItem>(id).cloned() {
+            Some(ProjectNavItem::Category(kind)) => {
+                if !self.collapsed_project_file_kinds.insert(kind) {
+                    self.collapsed_project_file_kinds.remove(&kind);
+                }
+                self.rebuild_project_nav();
+            }
+            Some(ProjectNavItem::File(path)) => {
+                self.selected_project_file = Some(path.clone());
+                self.open_file_tab(path);
+                self.nav.activate(id);
+            }
+            None => {
+                self.nav.activate(id);
+            }
+        }
 
         self.update_title()
     }
@@ -334,6 +467,128 @@ impl AppModel {
             self.set_window_title(window_title, id)
         } else {
             Task::none()
+        }
+    }
+
+    fn active_tab_view(&self) -> Element<'_, Message> {
+        let Some(tab) = self.tabs.active_data::<EditorTab>() else {
+            return widget::container(widget::text(fl!("select-file-to-open")))
+                .height(Length::Fill)
+                .width(Length::Fill)
+                .align_x(Horizontal::Center)
+                .align_y(Vertical::Center)
+                .into();
+        };
+
+        let editor_content = match tab.kind {
+            ProjectFileKind::DungeonRoomSet => fl!("dungeon-room-set-editor"),
+            ProjectFileKind::Map => fl!("map-editor"),
+            ProjectFileKind::MetaTiles => fl!("meta-tiles-editor"),
+            ProjectFileKind::ProjectConfig => fl!("project-config-editor"),
+            ProjectFileKind::TileSet2d => fl!("tile-set-2d-editor"),
+            ProjectFileKind::TileSet3d => fl!("tile-set-3d-editor"),
+            ProjectFileKind::Unknown => fl!("unknown-file-editor"),
+        };
+
+        widget::container(widget::column([
+            widget::text(format!("{} — {}", tab.name, tab.kind.editor_title())).into(),
+            widget::text(tab.path.display().to_string()).into(),
+            widget::text(editor_content).into(),
+        ]))
+        .height(Length::Fill)
+        .width(Length::Fill)
+        .align_x(Horizontal::Center)
+        .align_y(Vertical::Top)
+        .into()
+    }
+
+    fn close_tab(&mut self, id: segmented_button::Entity) {
+        if self.tabs.is_active(id) {
+            if let Some(position) = self.tabs.position(id) {
+                let next_position = if position == 0 {
+                    position + 1
+                } else {
+                    position - 1
+                };
+                self.tabs.activate_position(next_position);
+            }
+        }
+
+        self.tabs.remove(id);
+    }
+
+    fn open_file_tab(&mut self, path: PathBuf) {
+        let existing_tab = self.tabs.iter().find(|id| {
+            self.tabs
+                .data::<EditorTab>(*id)
+                .is_some_and(|tab| tab.path == path)
+        });
+
+        if let Some(id) = existing_tab {
+            self.tabs.activate(id);
+            return;
+        }
+
+        let Some(project_file) = self
+            .project
+            .as_ref()
+            .and_then(|project| project.files.iter().find(|file| file.path == path))
+        else {
+            return;
+        };
+
+        let tab = EditorTab {
+            path: project_file.path.clone(),
+            name: project_file.name.clone(),
+            kind: project_file.kind,
+        };
+
+        let id = self
+            .tabs
+            .insert()
+            .text(tab.name.clone())
+            .closable()
+            .data(tab)
+            .id();
+        self.tabs.activate(id);
+    }
+
+    fn rebuild_project_nav(&mut self) {
+        self.nav.clear();
+
+        let Some(project) = &self.project else {
+            return;
+        };
+
+        for kind in ProjectFileKind::ALL {
+            let files = project
+                .files
+                .iter()
+                .filter(|file| file.kind == kind)
+                .collect::<Vec<_>>();
+
+            if files.is_empty() {
+                continue;
+            }
+
+            let collapsed = self.collapsed_project_file_kinds.contains(&kind);
+            let triangle = if collapsed { "▸" } else { "▾" };
+            self.nav
+                .insert()
+                .text(format!("{triangle} {}", kind.label()))
+                .data(ProjectNavItem::Category(kind));
+
+            if collapsed {
+                continue;
+            }
+
+            for file in files {
+                self.nav
+                    .insert()
+                    .text(file.name.clone())
+                    .indent(1)
+                    .data(ProjectNavItem::File(file.path.clone()));
+            }
         }
     }
 
@@ -391,6 +646,7 @@ pub enum ContextPage {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MenuAction {
     About,
+    Open,
     Quit,
     Settings,
 }
@@ -401,8 +657,135 @@ impl menu::action::MenuAction for MenuAction {
     fn message(&self) -> Self::Message {
         match self {
             MenuAction::About => Message::ToggleContextPage(ContextPage::About),
+            MenuAction::Open => Message::OpenProject,
             MenuAction::Quit => Message::Quit,
             MenuAction::Settings => Message::ToggleContextPage(ContextPage::Settings),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum ProjectFileKind {
+    DungeonRoomSet,
+    Map,
+    MetaTiles,
+    ProjectConfig,
+    TileSet2d,
+    TileSet3d,
+    Unknown,
+}
+
+#[derive(Clone, Debug)]
+enum ProjectNavItem {
+    Category(ProjectFileKind),
+    File(PathBuf),
+}
+
+#[derive(Clone, Debug)]
+struct EditorTab {
+    path: PathBuf,
+    name: String,
+    kind: ProjectFileKind,
+}
+
+pub struct ProjectFile {
+    pub path: PathBuf,
+    pub name: String,
+    pub kind: ProjectFileKind,
+}
+
+pub struct Project {
+    pub root: PathBuf,
+    pub files: Vec<ProjectFile>,
+}
+
+impl Project {
+    pub fn open(root: PathBuf) -> io::Result<Self> {
+        if !root.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{} is not a directory", root.display()),
+            ));
+        }
+
+        let mut files = Vec::new();
+        let mut pending = vec![root.clone()];
+
+        while let Some(directory) = pending.pop() {
+            for entry in fs::read_dir(directory)? {
+                let entry = entry?;
+                let path = entry.path();
+                let file_type = entry.file_type()?;
+
+                if file_type.is_dir() {
+                    pending.push(path);
+                    continue;
+                }
+
+                if file_type.is_file() {
+                    let name = path
+                        .file_stem()
+                        .or_else(|| path.file_name())
+                        .map(|name| name.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+
+                    let kind = ProjectFileKind::from_path(&path);
+
+                    files.push(ProjectFile { path, name, kind });
+                }
+            }
+        }
+
+        files.sort_by(|a, b| a.path.cmp(&b.path));
+
+        Ok(Self { root, files })
+    }
+}
+
+impl ProjectFileKind {
+    const ALL: [Self; 7] = [
+        Self::ProjectConfig,
+        Self::Map,
+        Self::MetaTiles,
+        Self::TileSet2d,
+        Self::TileSet3d,
+        Self::DungeonRoomSet,
+        Self::Unknown,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::DungeonRoomSet => "Dungeon Room Sets",
+            Self::Map => "Maps",
+            Self::MetaTiles => "Meta Tiles",
+            Self::ProjectConfig => "Project Configs",
+            Self::TileSet2d => "2D Tile Sets",
+            Self::TileSet3d => "3D Tile Sets",
+            Self::Unknown => "Other Files",
+        }
+    }
+
+    fn editor_title(self) -> &'static str {
+        match self {
+            Self::DungeonRoomSet => "Dungeon Room Set Editor",
+            Self::Map => "Map Editor",
+            Self::MetaTiles => "Meta Tiles Editor",
+            Self::ProjectConfig => "Project Config Editor",
+            Self::TileSet2d => "2D Tile Set Editor",
+            Self::TileSet3d => "3D Tile Set Editor",
+            Self::Unknown => "File Viewer",
+        }
+    }
+
+    fn from_path(path: &std::path::Path) -> Self {
+        match path.extension().and_then(|extension| extension.to_str()) {
+            Some("2dtiles") => Self::TileSet2d,
+            Some("3dtiles") => Self::TileSet3d,
+            Some("map") => Self::Map,
+            Some("metatiles") => Self::MetaTiles,
+            Some("rooms") => Self::DungeonRoomSet,
+            Some("toml") => Self::ProjectConfig,
+            _ => Self::Unknown,
         }
     }
 }
